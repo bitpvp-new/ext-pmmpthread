@@ -1,0 +1,307 @@
+name: Release
+
+on:
+  release:
+    types: [published]
+  push:
+    tags:
+      - '*'
+  workflow_dispatch:
+    inputs:
+      tag_name:
+        description: 'Release tag name'
+        required: false
+        default: ''
+
+permissions:
+  contents: write
+
+jobs:
+  build-linux:
+    name: Linux - PHP ${{ matrix.php-short }}
+    runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - php: 8.1.33
+            php-short: "8.1"
+            opcache-shared: true
+          - php: 8.2.29
+            php-short: "8.2"
+            opcache-shared: true
+          - php: 8.3.28
+            php-short: "8.3"
+            opcache-shared: true
+          - php: 8.4.15
+            php-short: "8.4"
+            opcache-shared: true
+          - php: 8.5.0
+            php-short: "8.5"
+            opcache-shared: false
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set PHP build cache key
+        id: cache-key
+        run: echo "key=php-release-${{ matrix.php }}-ubuntu-22.04" >> $GITHUB_OUTPUT
+
+      - name: Check PHP build cache
+        uses: actions/cache@v4
+        id: cache
+        with:
+          path: ${{ github.workspace }}/php
+          key: ${{ steps.cache-key.outputs.key }}
+
+      - name: Install PHP build dependencies
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y re2c
+
+      - name: Download PHP
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: curl -L https://github.com/php/php-src/archive/refs/tags/php-${{ matrix.php }}.tar.gz | tar -xz
+
+      - name: Compile PHP
+        if: steps.cache.outputs.cache-hit != 'true'
+        working-directory: php-src-php-${{ matrix.php }}
+        run: |
+          ./buildconf --force
+          ./configure \
+            --disable-all \
+            --enable-cli \
+            --enable-zts \
+            --enable-sockets \
+            --enable-opcache \
+            --enable-opcache-jit \
+            --prefix="${{ github.workspace }}/php"
+          make -j $(nproc) install
+
+      - name: Compile extension
+        run: |
+          ${{ github.workspace }}/php/bin/phpize
+          ./configure --with-php-config=${{ github.workspace }}/php/bin/php-config --with-pmmpthread-sockets
+          make -j $(nproc)
+          make install
+
+      - name: Verify extension loads
+        run: |
+          ${{ github.workspace }}/php/bin/php -d extension=modules/pmmpthread.so -m | grep pmmpthread
+
+      - name: Package Linux artifacts
+        run: |
+          mkdir -p dist
+          cp modules/pmmpthread.so dist/pmmpthread-php${{ matrix.php-short }}-linux-x64.so
+          tar -czf dist/pmmpthread-php${{ matrix.php-short }}-linux-x64.tar.gz -C modules pmmpthread.so
+
+      - name: Upload Linux artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: pmmpthread-php${{ matrix.php-short }}-linux-x64
+          path: dist/*
+          if-no-files-found: error
+
+  build-windows:
+    name: Windows - PHP ${{ matrix.php-short }}
+    runs-on: windows-2022
+    env:
+      PHP_SDK_BINARY_TOOLS_VER: 2.4.0
+      PTHREAD_W32_VER: 3.0.0
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - php: 8.1.33
+            php-short: "8.1"
+            vs-crt: vs16
+            opcache-shared: true
+          - php: 8.2.29
+            php-short: "8.2"
+            vs-crt: vs16
+            opcache-shared: true
+          - php: 8.3.28
+            php-short: "8.3"
+            vs-crt: vs16
+            opcache-shared: true
+          - php: 8.4.15
+            php-short: "8.4"
+            vs-crt: vs17
+            opcache-shared: true
+          - php: 8.5.0
+            php-short: "8.5"
+            vs-crt: vs17
+            opcache-shared: false
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set PHP build cache key
+        id: cache-key
+        run: |
+          echo "key=php-release-${{ matrix.php }}-x64-${{ matrix.vs-crt }}-windows-2022-php-sdk-${{ env.PHP_SDK_BINARY_TOOLS_VER }}" >> $env:GITHUB_OUTPUT
+
+      - name: Set php-sdk task command
+        id: php-sdk-command
+        run: |
+          $vsToolsetFlag = ""
+          if ("${{ matrix.vs-crt }}" -eq "vs16") {
+              $vsToolsetFlag = "-s 14.29"
+          }
+          echo "command=`"${{ github.workspace }}\php-sdk\phpsdk-${{ matrix.vs-crt }}-x64.bat`" $vsToolsetFlag -t task.bat" >> $env:GITHUB_OUTPUT
+
+      - name: Check PHP build cache
+        uses: actions/cache@v4
+        id: cache
+        with:
+          path: |
+            bin
+            php-sdk
+            deps
+          key: ${{ steps.cache-key.outputs.key }}
+
+      - name: Checkout PHP build SDK
+        if: steps.cache.outputs.cache-hit != 'true'
+        uses: actions/checkout@v4
+        with:
+          repository: php/php-sdk-binary-tools
+          ref: php-sdk-${{ env.PHP_SDK_BINARY_TOOLS_VER }}
+          path: php-sdk
+
+      - name: Checkout PHP
+        if: steps.cache.outputs.cache-hit != 'true'
+        uses: actions/checkout@v4
+        with:
+          repository: php/php-src
+          ref: "php-${{ matrix.php }}"
+          path: php-src
+
+      - name: Download PHP build dependencies
+        if: steps.cache.outputs.cache-hit != 'true'
+        working-directory: php-sdk
+        run: |
+          $php_base = "${{ matrix.php }}" -replace '^(\d+)\.(\d+).*','$1.$2'
+          $deps_type = ""
+          if ("${{ matrix.php }}" -match '^(\d+)\.(\d+)\.(\d+)(.+)') {
+              $deps_type = "staging"
+          } else {
+              $deps_type = "stable"
+          }
+
+          echo "phpsdk_deps -u -t ${{ matrix.vs-crt }} -b $php_base -a x64 -s $deps_type -d `"${{ github.workspace }}\deps`" || exit 1" > task.bat
+          & ${{ steps.php-sdk-command.outputs.command }}
+
+      - name: Download pthreads4w dependency
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: |
+          C:\msys64\usr\bin\wget.exe -nv https://github.com/pmmp/DependencyMirror/releases/download/mirror/pthreads4w-code-v${{ env.PTHREAD_W32_VER }}.zip -O temp.zip
+          & "C:\Program Files\7-Zip\7z.exe" x -y temp.zip
+          rm temp.zip
+          mv pthreads4w-code-* pthreads4w-code
+
+      - name: Compile pthreads4w
+        if: steps.cache.outputs.cache-hit != 'true'
+        working-directory: pthreads4w-code
+        run: |
+          echo "nmake VC || exit 1" > task.bat
+          & ${{ steps.php-sdk-command.outputs.command }}
+
+      - name: Copy pthreads4w files to deps dir
+        if: steps.cache.outputs.cache-hit != 'true'
+        working-directory: pthreads4w-code
+        run: |
+          $DEPS_DIR="${{ github.workspace }}\deps"
+          cp pthread.h "$DEPS_DIR\include\pthread.h"
+          cp sched.h "$DEPS_DIR\include\sched.h"
+          cp semaphore.h "$DEPS_DIR\include\semaphore.h"
+          cp _ptw32.h "$DEPS_DIR\include\_ptw32.h"
+          cp pthreadVC3.lib "$DEPS_DIR\lib\pthreadVC3.lib"
+          cp pthreadVC3.dll "$DEPS_DIR\bin\pthreadVC3.dll"
+          cp pthreadVC3.pdb "$DEPS_DIR\bin\pthreadVC3.pdb"
+
+      - name: Compile PHP
+        if: steps.cache.outputs.cache-hit != 'true'
+        working-directory: php-src
+        run: |
+          echo "call buildconf.bat || exit 1" > task.bat
+          echo "call configure.bat^`
+            --disable-all^`
+            --enable-cli^`
+            --enable-zts^`
+            --enable-sockets^`
+            --enable-ipv6^`
+            --enable-opcache^`
+            --enable-opcache-jit^`
+            --with-prefix=`"${{ github.workspace }}\bin`"^`
+            --with-php-build=`"${{ github.workspace }}\deps`" || exit 1" >> task.bat
+          echo "nmake || exit 1" >> task.bat
+          echo "nmake install || exit 1" >> task.bat
+          cat task.bat
+
+          & ${{ steps.php-sdk-command.outputs.command }}
+
+      - name: Add pthreads4w DLL to build result
+        if: steps.cache.outputs.cache-hit != 'true'
+        working-directory: bin
+        run: |
+          cp "${{ github.workspace }}\deps\bin\pthreadVC*.*" .\
+
+      - name: Compile extension
+        run: |
+          echo "call ${{ github.workspace }}\bin\SDK\phpize.bat || exit 1" > task.bat
+          echo "call configure ^`
+            --with-pmmpthread^`
+            --with-pmmpthread-sockets^`
+            --with-prefix=`"${{ github.workspace }}\bin`"^`
+            --with-php-build=`"${{ github.workspace }}\deps`" || exit 1" >> task.bat
+          echo "nmake || exit 1" >> task.bat
+          echo "nmake install || exit 1" >> task.bat
+          cat task.bat
+
+          & ${{ steps.php-sdk-command.outputs.command }}
+
+      - name: Verify extension loads
+        working-directory: bin
+        run: |
+          .\php.exe -d extension_dir=ext -d extension=php_pmmpthread.dll -m | Select-String "pmmpthread"
+
+      - name: Package Windows artifacts
+        run: |
+          New-Item -ItemType Directory -Path dist -Force | Out-Null
+          Copy-Item "bin\ext\php_pmmpthread.dll" "dist\php_pmmpthread.dll"
+          Copy-Item "deps\bin\pthreadVC3.dll" "dist\pthreadVC3.dll"
+          Compress-Archive -Path "dist\php_pmmpthread.dll", "dist\pthreadVC3.dll" -DestinationPath "dist\pmmpthread-php${{ matrix.php-short }}-windows-x64.zip" -Force
+
+      - name: Upload Windows artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: pmmpthread-php${{ matrix.php-short }}-windows-x64
+          path: dist/*.zip
+          if-no-files-found: error
+
+  publish-release:
+    name: Publish Release
+    needs: [build-linux, build-windows]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+          merge-multiple: true
+
+      - name: List artifacts
+        run: ls -la release-assets/
+
+      - name: Publish Release to GitHub
+        uses: softprops/action-gh-release@v2
+        if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && inputs.tag_name != '')
+        with:
+          tag_name: ${{ inputs.tag_name || github.ref_name }}
+          files: |
+            release-assets/*.tar.gz
+            release-assets/*.zip
+            release-assets/*.so
